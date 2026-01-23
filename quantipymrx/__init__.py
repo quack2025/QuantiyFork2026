@@ -57,6 +57,34 @@ from quantipymrx.analysis.crosstab import (
     crosstab_batch,
     CrosstabResult,
 )
+from quantipymrx.analysis.significance import (
+    z_test_proportions,
+    t_test_means,
+    chi_square_test,
+    anova_oneway,
+    correlation,
+    correlation_matrix,
+)
+from quantipymrx.analysis.mrx import (
+    calculate_nps,
+    top_box,
+    bottom_box,
+    calculate_net,
+    mrx_summary,
+    NPSResult,
+    BoxResult,
+)
+from quantipymrx.analysis.auto import (
+    auto_analyze,
+    classify_variable,
+    detect_banners,
+    quick_summary,
+    suggest_analyses,
+    AutoAnalysisResult,
+)
+
+# Service layer
+from quantipymrx.service.analysis_service import AnalysisService
 
 __all__ = [
     # Version
@@ -74,11 +102,35 @@ __all__ = [
     "read_spss",
     "write_spss",
     "get_spss_info",
-    # Analysis
+    # Analysis - Frequency/Crosstab
     "frequency",
     "frequencies_batch",
     "FrequencyResult",
     "crosstab",
     "crosstab_batch",
     "CrosstabResult",
+    # Analysis - Significance
+    "z_test_proportions",
+    "t_test_means",
+    "chi_square_test",
+    "anova_oneway",
+    "correlation",
+    "correlation_matrix",
+    # Analysis - MRX
+    "calculate_nps",
+    "top_box",
+    "bottom_box",
+    "calculate_net",
+    "mrx_summary",
+    "NPSResult",
+    "BoxResult",
+    # Analysis - Auto
+    "auto_analyze",
+    "classify_variable",
+    "detect_banners",
+    "quick_summary",
+    "suggest_analyses",
+    "AutoAnalysisResult",
+    # Service
+    "AnalysisService",
 ]
