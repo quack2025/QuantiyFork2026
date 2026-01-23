@@ -6,10 +6,14 @@ Provides high-level API for all analysis operations.
 """
 
 import hashlib
+import logging
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 from quantipymrx.core.dataset import DataSet
 from quantipymrx.core.metadata import VariableType
@@ -57,8 +61,10 @@ class AnalysisService:
     def __init__(self):
         self._dataset: Optional[DataSet] = None
         self._analysis_cache: Dict[str, Any] = {}
+        self._cache_lock = threading.Lock()  # Thread-safety for cache operations
         self._auto_analysis: Optional[AutoAnalysisResult] = None
         self._export_dir: Path = Path("./exports")
+        logger.debug("AnalysisService initialized")
 
     # =========================================================================
     # DATASET MANAGEMENT
@@ -204,11 +210,20 @@ class AnalysisService:
 
         Returns JSON-serializable dict.
         """
+        cache_key = self._cache_key('frequency', variable, weight)
+
+        # Check cache first (thread-safe)
+        with self._cache_lock:
+            if cache_key in self._analysis_cache:
+                logger.debug(f"Cache hit for frequency '{variable}'")
+                return frequency_to_json(self._analysis_cache[cache_key])
+
+        logger.debug(f"Calculating frequency for '{variable}'")
         result = frequency(self.dataset, variable, weight=weight, **kwargs)
 
-        # Cache result
-        cache_key = self._cache_key('frequency', variable, weight)
-        self._analysis_cache[cache_key] = result
+        # Cache result (thread-safe)
+        with self._cache_lock:
+            self._analysis_cache[cache_key] = result
 
         return frequency_to_json(result)
 
@@ -224,11 +239,20 @@ class AnalysisService:
 
         Returns JSON-serializable dict.
         """
+        cache_key = self._cache_key('crosstab', f"{x}_by_{y}", weight)
+
+        # Check cache first (thread-safe)
+        with self._cache_lock:
+            if cache_key in self._analysis_cache:
+                logger.debug(f"Cache hit for crosstab '{x}' x '{y}'")
+                return crosstab_to_json(self._analysis_cache[cache_key])
+
+        logger.debug(f"Calculating crosstab '{x}' x '{y}'")
         result = crosstab(self.dataset, x=x, y=y, weight=weight, **kwargs)
 
-        # Cache result
-        cache_key = self._cache_key('crosstab', f"{x}_by_{y}", weight)
-        self._analysis_cache[cache_key] = result
+        # Cache result (thread-safe)
+        with self._cache_lock:
+            self._analysis_cache[cache_key] = result
 
         return crosstab_to_json(result)
 
@@ -600,6 +624,8 @@ class AnalysisService:
         return hashlib.md5(key_str.encode()).hexdigest()[:12]
 
     def clear_cache(self) -> None:
-        """Clear analysis cache."""
-        self._analysis_cache.clear()
-        self._auto_analysis = None
+        """Clear analysis cache (thread-safe)."""
+        with self._cache_lock:
+            self._analysis_cache.clear()
+            self._auto_analysis = None
+        logger.debug("Analysis cache cleared")

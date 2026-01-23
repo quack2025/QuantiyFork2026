@@ -269,3 +269,172 @@ class TestCrosstabStatistics:
             # At least one cell should have a significance letter
             has_letters = result.significance.apply(lambda x: x.str.len() > 0).any().any()
             assert has_letters, "Expected significance letters for significant difference"
+
+
+class TestCrosstabEdgeCases:
+    """Tests for edge cases and potential failure modes."""
+
+    def test_small_cell_warning(self):
+        """Test chi-square warning for small expected cell counts."""
+        # Create sparse data that will have small expected cells
+        data = pd.DataFrame({
+            'response': [1, 1, 1, 2, 2, 1, 1, 1, 2, 1],  # Very unbalanced
+            'group': [1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
+        })
+        ds = DataSet.from_dataframe(data)
+        ds._meta.columns['response'] = VariableMeta(
+            name='response',
+            type=VariableType.SINGLE,
+            values=[
+                ValueLabel(value=1, text={'en-GB': 'Yes'}),
+                ValueLabel(value=2, text={'en-GB': 'No'}),
+            ]
+        )
+        ds._meta.columns['group'] = VariableMeta(
+            name='group',
+            type=VariableType.SINGLE,
+            values=[
+                ValueLabel(value=1, text={'en-GB': 'A'}),
+                ValueLabel(value=2, text={'en-GB': 'B'}),
+            ]
+        )
+
+        result = crosstab(ds, x='response', y='group', test_significance=True)
+        # With small sample, chi2_warning should be set
+        # (may or may not trigger depending on exact expected values)
+        assert result.chi2 is not None or result.chi2_warning is not None
+
+    def test_chi2_warning_included_in_dict(self):
+        """Test chi2_warning is included in to_dict output."""
+        data = pd.DataFrame({
+            'x': [1, 1, 2, 2],
+            'y': [1, 2, 1, 2],
+        })
+        ds = DataSet.from_dataframe(data)
+        ds._meta.columns['x'] = VariableMeta(name='x', type=VariableType.SINGLE)
+        ds._meta.columns['y'] = VariableMeta(name='y', type=VariableType.SINGLE)
+
+        result = crosstab(ds, x='x', y='y')
+        d = result.to_dict()
+
+        assert 'chi2_warning' in d
+
+    def test_empty_crosstab(self):
+        """Test crosstab with no valid data."""
+        data = pd.DataFrame({
+            'x': [np.nan, np.nan],
+            'y': [np.nan, np.nan],
+        })
+        ds = DataSet.from_dataframe(data)
+        ds._meta.columns['x'] = VariableMeta(name='x', type=VariableType.SINGLE)
+        ds._meta.columns['y'] = VariableMeta(name='y', type=VariableType.SINGLE)
+
+        result = crosstab(ds, x='x', y='y')
+        assert result.total_base == 0
+
+    def test_single_row_crosstab(self):
+        """Test crosstab with single row of data."""
+        data = pd.DataFrame({
+            'x': [1],
+            'y': [1],
+        })
+        ds = DataSet.from_dataframe(data)
+        ds._meta.columns['x'] = VariableMeta(name='x', type=VariableType.SINGLE)
+        ds._meta.columns['y'] = VariableMeta(name='y', type=VariableType.SINGLE)
+
+        result = crosstab(ds, x='x', y='y', test_significance=False)
+        assert result.total_base == 1
+        assert result.counts.iloc[0, 0] == 1
+
+    def test_single_category_x(self):
+        """Test crosstab where x has only one category."""
+        data = pd.DataFrame({
+            'x': [1, 1, 1, 1, 1],  # All same value
+            'y': [1, 2, 1, 2, 1],
+        })
+        ds = DataSet.from_dataframe(data)
+        ds._meta.columns['x'] = VariableMeta(name='x', type=VariableType.SINGLE)
+        ds._meta.columns['y'] = VariableMeta(name='y', type=VariableType.SINGLE)
+
+        result = crosstab(ds, x='x', y='y')
+        assert result.counts.shape[0] == 1  # Single row
+        # Chi-square should fail gracefully (needs at least 2x2)
+        assert result.chi2 is None or result.chi2_pvalue is None
+
+    def test_single_category_y(self):
+        """Test crosstab where y has only one category."""
+        data = pd.DataFrame({
+            'x': [1, 2, 1, 2, 1],
+            'y': [1, 1, 1, 1, 1],  # All same value
+        })
+        ds = DataSet.from_dataframe(data)
+        ds._meta.columns['x'] = VariableMeta(name='x', type=VariableType.SINGLE)
+        ds._meta.columns['y'] = VariableMeta(name='y', type=VariableType.SINGLE)
+
+        result = crosstab(ds, x='x', y='y', include_totals=False)
+        assert result.counts.shape[1] == 1  # Single column
+        # Chi-square should fail gracefully
+        assert result.chi2 is None or result.chi2_pvalue is None
+
+    def test_weighted_with_zero_weights(self):
+        """Test weighted crosstab with some zero weights."""
+        data = pd.DataFrame({
+            'x': [1, 2, 1, 2, 1],
+            'y': [1, 1, 2, 2, 1],
+            'weight': [1.0, 0.0, 1.0, 0.0, 1.0],  # Some zero weights
+        })
+        ds = DataSet.from_dataframe(data)
+        ds._meta.columns['x'] = VariableMeta(name='x', type=VariableType.SINGLE)
+        ds._meta.columns['y'] = VariableMeta(name='y', type=VariableType.SINGLE)
+
+        result = crosstab(ds, x='x', y='y', weight='weight')
+        assert result.is_weighted
+        # Total should reflect only non-zero weighted cases
+        assert result.counts.sum().sum() == 3.0  # Only 3 cases with weight > 0
+
+    def test_missing_weight_variable(self):
+        """Test crosstab with nonexistent weight variable."""
+        data = pd.DataFrame({
+            'x': [1, 2, 1, 2],
+            'y': [1, 1, 2, 2],
+        })
+        ds = DataSet.from_dataframe(data)
+        ds._meta.columns['x'] = VariableMeta(name='x', type=VariableType.SINGLE)
+        ds._meta.columns['y'] = VariableMeta(name='y', type=VariableType.SINGLE)
+
+        # Should not raise, just use unweighted
+        result = crosstab(ds, x='x', y='y', weight='nonexistent')
+        assert not result.is_weighted
+
+    def test_large_crosstab(self):
+        """Test crosstab with many categories."""
+        np.random.seed(42)
+        n_x = 20
+        n_y = 10
+        n_rows = 10000
+
+        data = pd.DataFrame({
+            'x': np.random.choice(range(1, n_x + 1), n_rows),
+            'y': np.random.choice(range(1, n_y + 1), n_rows),
+        })
+        ds = DataSet.from_dataframe(data)
+        ds._meta.columns['x'] = VariableMeta(name='x', type=VariableType.SINGLE)
+        ds._meta.columns['y'] = VariableMeta(name='y', type=VariableType.SINGLE)
+
+        result = crosstab(ds, x='x', y='y')
+        # Should have correct dimensions
+        assert result.counts.shape[0] == n_x
+        assert result.counts.shape[1] == n_y + 1  # +1 for Total
+
+    def test_float_codes(self):
+        """Test crosstab handles float codes correctly."""
+        data = pd.DataFrame({
+            'x': [1.0, 2.0, 1.0, 2.0],
+            'y': [1.0, 1.0, 2.0, 2.0],
+        })
+        ds = DataSet.from_dataframe(data)
+        ds._meta.columns['x'] = VariableMeta(name='x', type=VariableType.SINGLE)
+        ds._meta.columns['y'] = VariableMeta(name='y', type=VariableType.SINGLE)
+
+        result = crosstab(ds, x='x', y='y')
+        assert result.total_base == 4

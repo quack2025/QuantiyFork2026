@@ -5,14 +5,22 @@ Calculate frequency distributions with counts, percentages, and statistics.
 Supports weighted analysis and multiple variable types.
 """
 
+import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, Union, TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
 if TYPE_CHECKING:
     from quantipymrx.core.dataset import DataSet
+
+logger = logging.getLogger(__name__)
+
+# Supported delimited set separators
+DELIMITED_SEPARATORS = [';', ',', '|', ' ']
+DELIMITED_PATTERN = re.compile(r'[;,|\s]+')
 
 
 @dataclass
@@ -155,6 +163,8 @@ def frequency(
     meta = dataset.get_variable_meta(variable)
     text_key = dataset.text_key
 
+    logger.debug(f"Calculating frequency for '{variable}'")
+
     # Get the column data
     col_data = data[variable].copy()
 
@@ -162,14 +172,20 @@ def frequency(
     missing_codes = meta.missing_values if meta else None
     if missing_codes and not include_missing:
         col_data = col_data.replace(missing_codes, np.nan)
+        logger.debug(f"Excluded missing codes: {missing_codes}")
 
-    # Calculate weights
-    if weight and weight in data.columns:
-        weights = data[weight].fillna(0)
-        is_weighted = True
+    # Calculate weights - FIXED: explicit check, not heuristic
+    is_weighted = False
+    if weight is not None:
+        if weight not in data.columns:
+            logger.warning(f"Weight variable '{weight}' not found, using unweighted")
+            weights = pd.Series(1.0, index=data.index)
+        else:
+            weights = data[weight].fillna(0).astype(float)
+            is_weighted = True
+            logger.debug(f"Using weight variable '{weight}'")
     else:
-        weights = pd.Series(1, index=data.index)
-        is_weighted = False
+        weights = pd.Series(1.0, index=data.index)
 
     # Get value labels
     value_labels = {}
@@ -179,11 +195,11 @@ def frequency(
     # Calculate frequency based on variable type
     if meta and meta.is_multi:
         table = _frequency_delimited_set(
-            col_data, weights, value_labels, show_labels, decimals
+            col_data, weights, value_labels, show_labels, decimals, is_weighted
         )
     else:
         table = _frequency_single(
-            col_data, weights, value_labels, show_labels, decimals
+            col_data, weights, value_labels, show_labels, decimals, is_weighted
         )
 
     # Calculate base
@@ -191,27 +207,21 @@ def frequency(
     base = int(valid_mask.sum())
     weighted_base = float(weights[valid_mask].sum()) if is_weighted else None
 
-    # Calculate statistics for numeric variables
+    # Calculate statistics for numeric/categorical variables
     mean_val = std_val = median_val = None
-    if meta and meta.is_numeric:
+    if meta and (meta.is_numeric or (meta.is_categorical and meta.values)):
         numeric_data = pd.to_numeric(col_data, errors='coerce')
-        if is_weighted:
-            mean_val = _weighted_mean(numeric_data, weights)
-            std_val = _weighted_std(numeric_data, weights)
-        else:
-            mean_val = numeric_data.mean()
-            std_val = numeric_data.std()
-        median_val = numeric_data.median()
-    elif meta and meta.is_categorical and meta.values:
-        # Calculate mean of codes for categorical
-        numeric_data = pd.to_numeric(col_data, errors='coerce')
-        if is_weighted:
-            mean_val = _weighted_mean(numeric_data, weights)
-            std_val = _weighted_std(numeric_data, weights)
-        else:
-            mean_val = numeric_data.mean()
-            std_val = numeric_data.std()
-        median_val = numeric_data.median()
+        valid = numeric_data.notna()
+
+        if valid.sum() > 0:
+            if is_weighted:
+                mean_val = _weighted_mean(numeric_data, weights)
+                std_val = _weighted_std(numeric_data, weights)
+                median_val = _weighted_median(numeric_data, weights)
+            else:
+                mean_val = float(numeric_data.mean())
+                std_val = float(numeric_data.std())
+                median_val = float(numeric_data.median())
 
     return FrequencyResult(
         variable=variable,
@@ -234,49 +244,119 @@ def _frequency_single(
     value_labels: Dict[int, str],
     show_labels: bool,
     decimals: int,
+    is_weighted: bool,
 ) -> pd.DataFrame:
     """Calculate frequency for single-choice variable."""
-    # Get value counts
-    if weights.sum() > len(weights):  # Weighted
-        # Weighted frequency
-        freq_data = col_data.dropna()
-        weight_data = weights[col_data.notna()]
+    # Always calculate weighted counts (weights=1 if unweighted)
+    freq_data = col_data.dropna()
+    weight_data = weights[col_data.notna()]
 
-        counts = {}
-        for val in freq_data.unique():
-            mask = freq_data == val
-            counts[val] = weight_data[mask].sum()
+    counts = {}
+    for val in freq_data.unique():
+        mask = freq_data == val
+        counts[val] = weight_data[mask].sum()
 
-        counts_series = pd.Series(counts).sort_index()
-    else:
-        counts_series = col_data.value_counts().sort_index()
+    if not counts:
+        # Empty result
+        return pd.DataFrame({
+            'Value': [],
+            'Label': [],
+            'Count': [],
+            'Percent': [],
+        })
+
+    counts_series = pd.Series(counts).sort_index()
 
     # Calculate percentages
     total = counts_series.sum()
     pct = (counts_series / total * 100).round(decimals) if total > 0 else counts_series * 0
 
-    # Build table
-    if show_labels and value_labels:
-        index = [value_labels.get(int(v), str(v)) for v in counts_series.index]
-    else:
-        index = counts_series.index.tolist()
+    # Build table - safely handle index conversion
+    value_list = counts_series.index.tolist()
+    label_list = []
+    for v in value_list:
+        try:
+            label_list.append(value_labels.get(int(v), '') if value_labels else '')
+        except (ValueError, TypeError):
+            label_list.append(str(v))
 
     table = pd.DataFrame({
-        'Value': counts_series.index.tolist(),
-        'Label': [value_labels.get(int(v), '') for v in counts_series.index] if value_labels else [''] * len(counts_series),
+        'Value': value_list,
+        'Label': label_list,
         'Count': counts_series.values,
         'Percent': pct.values,
     })
 
     # Set proper index
     if show_labels and value_labels:
+        index = []
+        for v in value_list:
+            try:
+                index.append(value_labels.get(int(v), str(v)))
+            except (ValueError, TypeError):
+                index.append(str(v))
         table.index = index
         table.index.name = 'Response'
     else:
-        table.index = counts_series.index
+        table.index = pd.Index(value_list)
         table.index.name = 'Code'
 
     return table
+
+
+def _parse_delimited_value(val: Any) -> Set[int]:
+    """
+    Parse a delimited set value into a set of integer codes.
+
+    Supports multiple formats:
+    - "1;2;3;" (semicolon, Quantipy standard)
+    - "1,2,3" (comma)
+    - "1|2|3" (pipe)
+    - "{1,2,3}" (SPSS MR format)
+    - "1 2 3" (space separated)
+
+    Parameters
+    ----------
+    val : Any
+        Value to parse.
+
+    Returns
+    -------
+    set of int
+        Parsed codes.
+    """
+    if pd.isna(val):
+        return set()
+
+    val_str = str(val).strip()
+
+    # Handle empty
+    if not val_str or val_str.lower() == 'nan':
+        return set()
+
+    # Remove SPSS MR brackets if present
+    if val_str.startswith('{') and val_str.endswith('}'):
+        val_str = val_str[1:-1]
+
+    # Split by any common delimiter
+    codes = set()
+    parts = DELIMITED_PATTERN.split(val_str)
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        try:
+            # Handle both int and float representations
+            code = int(float(part))
+            codes.add(code)
+        except (ValueError, TypeError):
+            # Log but don't fail - might be label text
+            logger.debug(f"Could not parse delimited code: '{part}'")
+            continue
+
+    return codes
 
 
 def _frequency_delimited_set(
@@ -285,33 +365,31 @@ def _frequency_delimited_set(
     value_labels: Dict[int, str],
     show_labels: bool,
     decimals: int,
+    is_weighted: bool,
 ) -> pd.DataFrame:
     """Calculate frequency for multiple-choice (delimited set) variable."""
-    # Parse delimited values (format: "1;2;3;")
-    all_codes = set()
-    parsed_data = []
+    all_codes: Set[int] = set()
+    parsed_data: List[Set[int]] = []
 
+    # Parse all values
     for idx, val in col_data.items():
-        if pd.isna(val):
-            parsed_data.append(set())
-            continue
-
-        # Parse codes from delimited string
-        codes = set()
-        for code_str in str(val).split(';'):
-            code_str = code_str.strip()
-            if code_str and code_str != 'nan':
-                try:
-                    codes.add(int(float(code_str)))
-                except ValueError:
-                    continue
+        codes = _parse_delimited_value(val)
         parsed_data.append(codes)
         all_codes.update(codes)
 
-    # Count each code
+    if not all_codes:
+        logger.warning("No valid codes found in delimited set variable")
+        return pd.DataFrame({
+            'Value': [],
+            'Label': [],
+            'Count': [],
+            'Percent': [],
+        })
+
+    # Count each code with weights
     counts = {}
     for code in sorted(all_codes):
-        count = 0
+        count = 0.0
         for idx, codes in enumerate(parsed_data):
             if code in codes:
                 count += weights.iloc[idx]
@@ -319,23 +397,28 @@ def _frequency_delimited_set(
 
     counts_series = pd.Series(counts).sort_index()
 
-    # Calculate percentages (% of respondents)
-    base = (col_data.notna() * weights).sum()
+    # Calculate percentages (% of respondents who answered)
+    # Base is respondents with at least one selection
+    responding_mask = col_data.notna() & (col_data != '') & (col_data != '{}')
+    base = weights[responding_mask].sum()
     pct = (counts_series / base * 100).round(decimals) if base > 0 else counts_series * 0
 
     # Build table
+    value_list = counts_series.index.tolist()
+    label_list = [value_labels.get(v, '') for v in value_list] if value_labels else [''] * len(value_list)
+
     table = pd.DataFrame({
-        'Value': counts_series.index.tolist(),
-        'Label': [value_labels.get(v, '') for v in counts_series.index] if value_labels else [''] * len(counts_series),
+        'Value': value_list,
+        'Label': label_list,
         'Count': counts_series.values,
         'Percent': pct.values,
     })
 
     if show_labels and value_labels:
-        table.index = [value_labels.get(v, str(v)) for v in counts_series.index]
+        table.index = [value_labels.get(v, str(v)) for v in value_list]
         table.index.name = 'Response'
     else:
-        table.index = counts_series.index
+        table.index = pd.Index(value_list)
         table.index.name = 'Code'
 
     return table
@@ -346,7 +429,7 @@ def _weighted_mean(data: pd.Series, weights: pd.Series) -> float:
     valid = data.notna()
     if valid.sum() == 0:
         return np.nan
-    return np.average(data[valid], weights=weights[valid])
+    return float(np.average(data[valid], weights=weights[valid]))
 
 
 def _weighted_std(data: pd.Series, weights: pd.Series) -> float:
@@ -360,7 +443,66 @@ def _weighted_std(data: pd.Series, weights: pd.Series) -> float:
 
     mean = np.average(d, weights=w)
     variance = np.average((d - mean) ** 2, weights=w)
-    return np.sqrt(variance)
+    return float(np.sqrt(variance))
+
+
+def _weighted_median(data: pd.Series, weights: pd.Series) -> float:
+    """
+    Calculate weighted median.
+
+    Uses linear interpolation for weighted percentiles.
+
+    Parameters
+    ----------
+    data : pd.Series
+        Data values.
+    weights : pd.Series
+        Weight values.
+
+    Returns
+    -------
+    float
+        Weighted median.
+    """
+    valid = data.notna() & weights.notna() & (weights > 0)
+    if valid.sum() == 0:
+        return np.nan
+
+    d = data[valid].values
+    w = weights[valid].values
+
+    # Sort by data values
+    sort_idx = np.argsort(d)
+    d_sorted = d[sort_idx]
+    w_sorted = w[sort_idx]
+
+    # Cumulative weights
+    cumsum = np.cumsum(w_sorted)
+    total = cumsum[-1]
+
+    # Find median position (50th percentile)
+    median_pos = total / 2
+
+    # Find index where cumsum crosses median position
+    idx = np.searchsorted(cumsum, median_pos)
+
+    if idx == 0:
+        return float(d_sorted[0])
+    elif idx >= len(d_sorted):
+        return float(d_sorted[-1])
+    else:
+        # Linear interpolation
+        lower_cumsum = cumsum[idx - 1] if idx > 0 else 0
+        upper_cumsum = cumsum[idx]
+        lower_val = d_sorted[idx - 1] if idx > 0 else d_sorted[0]
+        upper_val = d_sorted[idx]
+
+        if upper_cumsum == lower_cumsum:
+            return float(upper_val)
+
+        # Interpolate
+        frac = (median_pos - lower_cumsum) / (upper_cumsum - lower_cumsum)
+        return float(lower_val + frac * (upper_val - lower_val))
 
 
 def frequencies_batch(
@@ -391,12 +533,14 @@ def frequencies_batch(
     if variables is None:
         variables = dataset.singles() + dataset.multis()
 
+    logger.info(f"Calculating frequencies for {len(variables)} variables")
+
     results = {}
     for var in variables:
         if var in dataset:
             try:
                 results[var] = frequency(dataset, var, weight=weight, **kwargs)
             except Exception as e:
-                print(f"Warning: Could not calculate frequency for {var}: {e}")
+                logger.error(f"Could not calculate frequency for {var}: {e}")
 
     return results

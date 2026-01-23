@@ -5,10 +5,14 @@ Modern SPSS file handling using pyreadstat.
 Extracts complete metadata including labels, missing values, and variable types.
 """
 
+import logging
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 try:
     import pyreadstat
@@ -71,6 +75,8 @@ def read_spss(
     if not filepath.exists():
         raise FileNotFoundError(f"SPSS file not found: {filepath}")
 
+    logger.info(f"Reading SPSS file: {filepath}")
+
     # Read with pyreadstat
     read_kwargs: Dict[str, Any] = {
         "apply_value_formats": apply_value_formats,
@@ -80,12 +86,15 @@ def read_spss(
         read_kwargs["encoding"] = encoding
 
     df, spss_meta = pyreadstat.read_sav(str(filepath), **read_kwargs)
+    logger.debug(f"Read {len(df)} rows, {len(df.columns)} columns")
 
     # Build our metadata structure
     meta = _build_metadata(df, spss_meta, text_key, filepath.name)
 
     # Post-process data
     df = _process_dataframe(df, meta, spss_meta, convert_categoricals)
+
+    logger.info(f"SPSS file loaded: {meta.info.case_count} cases, {len(meta.columns)} variables")
 
     return df, meta
 
@@ -183,7 +192,7 @@ def _determine_type_and_values(
         ]
 
         # Check if it's part of a multiple response set -> delimited set
-        if _is_multi_response(col_name, spss_meta):
+        if _is_multi_response(col_name, spss_meta, df):
             return VariableType.DELIMITED_SET, values
 
         return VariableType.SINGLE, values
@@ -219,12 +228,73 @@ def _determine_type_and_values(
     return VariableType.STRING, None
 
 
-def _is_multi_response(col_name: str, spss_meta: Any) -> bool:
-    """Check if variable is part of a multiple response set."""
-    if not hasattr(spss_meta, 'readstat_variable_types'):
-        return False
-    # This would need more sophisticated detection
-    # For now, return False - will be enhanced
+def _is_multi_response(col_name: str, spss_meta: Any, df: pd.DataFrame) -> bool:
+    """
+    Check if variable is a multiple response (delimited set) variable.
+
+    Detection methods:
+    1. Check pyreadstat's multiple response sets metadata
+    2. Detect by data format (values like "1;2;3;")
+    3. Detect by variable name pattern (common MR suffixes)
+
+    Parameters
+    ----------
+    col_name : str
+        Variable name.
+    spss_meta : Any
+        pyreadstat metadata object.
+    df : pd.DataFrame
+        Data frame for content inspection.
+
+    Returns
+    -------
+    bool
+        True if variable appears to be multi-response.
+    """
+    # Method 1: Check pyreadstat's multiple response sets
+    # pyreadstat >= 1.2.0 may have multiple_response_sets attribute
+    if hasattr(spss_meta, 'multiple_response_sets'):
+        mr_sets = spss_meta.multiple_response_sets or {}
+        for set_name, set_info in mr_sets.items():
+            if col_name in set_info.get('variables', []):
+                logger.debug(f"'{col_name}' is part of MR set '{set_name}'")
+                return True
+
+    # Method 2: Check if data contains delimited values (e.g., "1;2;3;")
+    if col_name in df.columns:
+        col_data = df[col_name].dropna()
+        if len(col_data) > 0:
+            # Sample first 100 non-null values
+            sample = col_data.head(100)
+
+            # Check for common delimited set patterns
+            delimited_pattern = re.compile(r'^\d+[;,|\s]\d+')  # e.g., "1;2" or "1,2"
+            quantipy_pattern = re.compile(r'^\d+;$|^\d+;\d+')  # e.g., "1;" or "1;2;3"
+
+            matches = 0
+            for val in sample:
+                val_str = str(val)
+                if delimited_pattern.match(val_str) or quantipy_pattern.match(val_str):
+                    matches += 1
+
+            # If >10% of values match delimited pattern, likely multi-response
+            if matches > len(sample) * 0.1:
+                logger.debug(f"'{col_name}' detected as multi-response by data pattern")
+                return True
+
+    # Method 3: Check for common MR naming patterns
+    # (usually set at the mask/array level, not individual variables)
+    mr_patterns = [
+        r'_mr$',           # ends with _mr
+        r'_multi$',        # ends with _multi
+        r'^mr_',           # starts with mr_
+        r'_multiresp$',    # ends with _multiresp
+    ]
+    for pattern in mr_patterns:
+        if re.search(pattern, col_name, re.IGNORECASE):
+            logger.debug(f"'{col_name}' detected as multi-response by name pattern")
+            return True
+
     return False
 
 

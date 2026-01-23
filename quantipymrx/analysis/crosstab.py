@@ -5,6 +5,7 @@ Cross-tabulation between two variables with counts, percentages,
 and statistical significance testing.
 """
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, TYPE_CHECKING
@@ -14,6 +15,8 @@ from scipy import stats
 
 if TYPE_CHECKING:
     from quantipymrx.core.dataset import DataSet
+
+logger = logging.getLogger(__name__)
 
 
 StatType = Literal['counts', 'col_pct', 'row_pct', 'total_pct', 'mean', 'stddev']
@@ -68,6 +71,7 @@ class CrosstabResult:
     total_base: int = 0
     chi2: Optional[float] = None
     chi2_pvalue: Optional[float] = None
+    chi2_warning: Optional[str] = None  # Warning if expected cells < 5
     significance: Optional[pd.DataFrame] = None
     is_weighted: bool = False
     text_key: str = "en-GB"
@@ -100,6 +104,7 @@ class CrosstabResult:
             'total_base': self.total_base,
             'chi2': self.chi2,
             'chi2_pvalue': self.chi2_pvalue,
+            'chi2_warning': self.chi2_warning,
             'is_weighted': self.is_weighted,
         }
 
@@ -268,20 +273,22 @@ def crosstab(
     total_base = int(col_totals.get('Total', col_totals.sum()))
 
     # Significance testing
-    chi2 = chi2_pvalue = None
+    chi2 = chi2_pvalue = chi2_warning = None
     significance = None
 
     if test_significance and len(counts.columns) > 1:
         # Chi-square test (exclude Total column)
         test_counts = counts.drop('Total', axis=1, errors='ignore')
         if test_counts.shape[0] > 1 and test_counts.shape[1] > 1:
-            chi2, chi2_pvalue = _chi_square_test(test_counts)
+            chi2, chi2_pvalue, chi2_warning = _chi_square_test(test_counts)
 
             # Column proportion tests
             significance = _column_proportion_tests(
                 test_counts, col_pct.drop('Total', axis=1, errors='ignore'),
                 sig_level
             )
+
+    logger.debug(f"Crosstab '{x}' x '{y}': base={total_base}, chi2_p={chi2_pvalue}")
 
     return CrosstabResult(
         x=x,
@@ -297,6 +304,7 @@ def crosstab(
         total_base=total_base,
         chi2=chi2,
         chi2_pvalue=chi2_pvalue,
+        chi2_warning=chi2_warning,
         significance=significance,
         is_weighted=is_weighted,
         text_key=text_key,
@@ -382,13 +390,55 @@ def _crosstab_multi_x(
     return result
 
 
-def _chi_square_test(counts: pd.DataFrame) -> Tuple[float, float]:
-    """Perform chi-square test of independence."""
+def _chi_square_test(counts: pd.DataFrame) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """
+    Perform chi-square test of independence with cell size validation.
+
+    Returns
+    -------
+    tuple
+        (chi2 statistic, p-value, warning message or None)
+
+    Notes
+    -----
+    The chi-square test assumption requires expected cell frequencies >= 5.
+    When more than 20% of cells have expected count < 5, results may be unreliable.
+    """
     try:
         chi2, pvalue, dof, expected = stats.chi2_contingency(counts.values)
-        return float(chi2), float(pvalue)
-    except Exception:
-        return None, None
+
+        # Check for small expected cell counts
+        warning = None
+        small_cells = (expected < 5).sum()
+        total_cells = expected.size
+        pct_small = small_cells / total_cells * 100
+
+        if pct_small > 20:
+            warning = (
+                f"Chi-square assumption violated: {small_cells} of {total_cells} "
+                f"cells ({pct_small:.0f}%) have expected count < 5. "
+                "Consider using Fisher's exact test or combining categories."
+            )
+            logger.warning(warning)
+        elif small_cells > 0:
+            warning = (
+                f"Note: {small_cells} of {total_cells} cells have expected count < 5. "
+                "Results should be interpreted with caution."
+            )
+            logger.debug(warning)
+
+        # Also warn if any expected cell is < 1
+        if (expected < 1).any():
+            warning = (
+                "Chi-square test unreliable: some expected cell counts < 1. "
+                "Consider combining categories."
+            )
+            logger.warning(warning)
+
+        return float(chi2), float(pvalue), warning
+    except Exception as e:
+        logger.error(f"Chi-square test failed: {e}")
+        return None, None, None
 
 
 def _column_proportion_tests(
