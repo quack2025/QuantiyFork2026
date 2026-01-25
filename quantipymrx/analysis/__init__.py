@@ -65,6 +65,32 @@ from quantipymrx.analysis.auto import (
     BatteryGroup,
 )
 
+# Auto-detection module (improved pattern detection)
+from quantipymrx.analysis.auto_detect import (
+    auto_detect,
+    suggest_banners as suggest_banners_v2,
+    detect_groups,
+    PatternDetector,
+    ProcessingSpec,
+    DetectedGroup,
+    DetectedBanner,
+    DetectedVariable,
+    QuestionType,
+    BannerType,
+)
+
+# Grouping engine
+from quantipymrx.analysis.grouping import (
+    GroupingEngine,
+    process_all_groups,
+    combine_mentions,
+    combine_awareness,
+    GroupedFrequency,
+    GridSummary,
+    TopOfMindSummary,
+    AwarenessSummary,
+)
+
 __all__ = [
     # Frequency
     "frequency",
@@ -125,4 +151,24 @@ __all__ = [
     "VariableClassification",
     "BannerSpec",
     "BatteryGroup",
+    # Auto-detect (v2)
+    "auto_detect",
+    "suggest_banners_v2",
+    "detect_groups",
+    "PatternDetector",
+    "ProcessingSpec",
+    "DetectedGroup",
+    "DetectedBanner",
+    "DetectedVariable",
+    "QuestionType",
+    "BannerType",
+    # Grouping
+    "GroupingEngine",
+    "process_all_groups",
+    "combine_mentions",
+    "combine_awareness",
+    "GroupedFrequency",
+    "GridSummary",
+    "TopOfMindSummary",
+    "AwarenessSummary",
 ]

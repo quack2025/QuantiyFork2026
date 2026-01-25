@@ -3,6 +3,7 @@ QuantipyMRX - SPSS Reader/Writer
 
 Modern SPSS file handling using pyreadstat.
 Extracts complete metadata including labels, missing values, and variable types.
+Includes i18n support for proper character encoding in multiple languages.
 """
 
 import logging
@@ -30,6 +31,15 @@ from quantipymrx.core.metadata import (
     ValueLabel,
     ArrayMeta,
 )
+
+# Import i18n utilities for encoding fix
+try:
+    from quantipymrx._compat.i18n import fix_encoding
+    HAS_I18N = True
+except ImportError:
+    HAS_I18N = False
+    def fix_encoding(text):
+        return text
 
 
 def read_spss(
@@ -151,10 +161,12 @@ def _build_variable_meta(
 ) -> VariableMeta:
     """Build metadata for a single variable."""
 
-    # Get variable label
+    # Get variable label and fix encoding
     label = ""
     if col_index < len(spss_meta.column_labels):
         label = spss_meta.column_labels[col_index] or ""
+        if HAS_I18N and label:
+            label = fix_encoding(label)
 
     # Determine variable type and get value labels
     var_type, values = _determine_type_and_values(
@@ -186,10 +198,13 @@ def _determine_type_and_values(
     # Check if variable has value labels -> categorical
     if col_name in spss_meta.variable_value_labels:
         value_labels = spss_meta.variable_value_labels[col_name]
-        values = [
-            ValueLabel(value=int(code), text={text_key: str(label)})
-            for code, label in sorted(value_labels.items())
-        ]
+        values = []
+        for code, label in sorted(value_labels.items()):
+            # Fix encoding for value labels (important for i18n support)
+            label_text = str(label)
+            if HAS_I18N:
+                label_text = fix_encoding(label_text)
+            values.append(ValueLabel(value=int(code), text={text_key: label_text}))
 
         # Check if it's part of a multiple response set -> delimited set
         if _is_multi_response(col_name, spss_meta, df):

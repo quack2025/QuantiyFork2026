@@ -334,6 +334,7 @@ def _crosstab_single(
         columns='y',
         aggfunc='sum',
         fill_value=0,
+        observed=False,  # Keep all categories, not just observed ones
     )
 
     return result
