@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import logging
+import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
@@ -193,6 +194,116 @@ PATTERNS = {
     # Awareness
     'awareness': re.compile(r'(?:^|[-_])(?:aware|conoce|conocimiento|brand[-_]?aware)(?:$|[-_])', re.IGNORECASE),
 }
+
+# =============================================================================
+# Banner detection by whole words (2026-11-10)
+# =============================================================================
+# `PATTERNS` above only see a word joined by `-`/`_`, so a label with spaces
+# ("¿En cuál ciudad vive?") never matches, and "Género" (with an accent) does
+# not match "genero". These are used ONLY to suggest banners; they never change
+# a question's type.
+
+def _fold_words(text: Optional[str]) -> List[str]:
+    """Words of a name or label: no accents, lower case (`P1_EDAD` -> p1, edad)."""
+    if not text:
+        return []
+    decomposed = unicodedata.normalize("NFKD", str(text))
+    plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+    return re.findall(r"[a-z0-9]+", plain)
+
+
+def _has_phrase(words: List[str], phrase: str) -> bool:
+    target = _fold_words(phrase)
+    n = len(target)
+    return any(words[i:i + n] == target for i in range(len(words) - n + 1))
+
+
+def _any_phrase(words: List[str], phrases: List[str]) -> bool:
+    return any(_has_phrase(words, p) for p in phrases)
+
+
+_BANNER_TERMS: List[Tuple["BannerType", List[str]]] = [
+    (BannerType.GENDER, ["sexo", "genero", "gender", "sex"]),
+    (BannerType.AGE_GROUP, ["rango de edad", "rangos de edad", "grupo de edad", "grupo etario", "age group", "age band", "faixa etaria"]),
+    (BannerType.AGE, ["edad", "age", "idade"]),
+    (BannerType.REGION, ["ciudad", "region", "provincia", "city", "cidade", "regiao"]),
+    # «ingresos» alone is ambiguous (an insurance against loss of income): only as
+    # a phrase that asks about the respondent's income.
+    (BannerType.INCOME, ["estrato", "nse", "nivel socioeconomico", "nivel socio economico", "clase social", "household income", "income level",
+                         "nivel de ingresos", "nivel de ingreso", "ingreso familiar", "ingresos familiares", "ingreso mensual", "ingresos mensuales",
+                         "ingresos del hogar", "ingreso del hogar", "renda familiar", "renda mensal", "classe social"]),
+    (BannerType.EDUCATION, ["escolaridad", "nivel educativo", "nivel de estudios", "education", "escolaridade"]),
+    (BannerType.OCCUPATION, ["ocupacion", "occupation", "ocupacao"]),
+]
+_OTHER_PERSON = {
+    "hijo", "hija", "hijos", "hijas", "nino", "nina", "ninos", "bebe", "pareja", "conyuge",
+    "child", "children", "daughter", "partner", "filho", "filha", "filhos", "mascota", "pet",
+    "vehiculo", "carro", "auto", "car",
+}
+_CHECKBOX_VALUES = {
+    "seleccionado", "no seleccionado", "selected", "not selected", "checked", "unchecked", "marcado", "no marcado",
+    "si", "no", "yes", "sim", "nao", "0", "1",
+}
+_SEX_VALUES = {"hombre", "mujer", "masculino", "femenino", "male", "female", "man", "woman", "homem", "mulher"}
+# Value labels shaped like age ranges: "18-24", "25 a 34", "55+", "55 o más",
+# "Menos de 25", "65 and over". Matched on the folded label (no accents).
+_AGE_RANGE_SHAPES = [
+    re.compile(r"^(\d{2}) ?[-–] ?(\d{2})(?: anos| years)?$"),
+    re.compile(r"^(\d{2}) (?:a|al|to|y|e) (\d{2})(?: anos| years)?$"),
+    re.compile(r"^(\d{2}) ?(?:\+|o mas|y mas|anos o mas|and over|or more|ou mais|anos ou mais)$"),
+    re.compile(r"^(?:menos de|menor de|under|less than|ate) (\d{2})(?: anos| years)?$"),
+]
+
+
+def _age_ranges_in_values(categories: List[str]) -> bool:
+    """At least 3 value labels are age ranges (two-digit ages 12-99, no money)."""
+    hits = 0
+    for c in categories:
+        if any(sym in c for sym in ("$", "€", "£", "%")):
+            return False
+        decomposed = unicodedata.normalize("NFKD", str(c))
+        text = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        text = re.sub(r"\s+", " ", text).strip().rstrip(".")
+        for shape in _AGE_RANGE_SHAPES:
+            m = shape.match(text)
+            if m and all(12 <= int(g) <= 99 for g in m.groups() if g):
+                hits += 1
+                break
+    return hits >= 3
+
+
+def _profile_banner_type(var_name: str, label: str, categories: List[str]) -> Optional["BannerType"]:
+    """The profile kind of a question by whole words of its name and label, or None."""
+    words = _fold_words(var_name) + _fold_words(label)
+    value_words = {w for c in categories for w in _fold_words(c)}
+    about_someone_else = any(w in _OTHER_PERSON for w in words)
+    # An option of a multiple-response question ("<option>: ¿Cuáles de…?",
+    # values selected / not selected) is not a profile question, whatever
+    # words its label has.
+    folded_values = {" ".join(_fold_words(c)) for c in categories}
+    if len(categories) <= 2 and folded_values & _CHECKBOX_VALUES and not (value_words & _SEX_VALUES):
+        return None
+    # An item of a series ("P9_6" labelled "<product>: <attribute>"): the
+    # profile word is the item's text, not what the question asks about the
+    # respondent.
+    if re.search(r"[_.]\d+$", var_name) and ":" in (label or ""):
+        return None
+    for banner_type, terms in _BANNER_TERMS:
+        if about_someone_else and banner_type not in (BannerType.REGION, BannerType.INCOME):
+            continue
+        if not _any_phrase(words, terms):
+            continue
+        # «Género musical»: a gender question has sex values.
+        if banner_type == BannerType.GENDER and value_words and not (value_words & _SEX_VALUES):
+            continue
+        return banner_type
+    # «¿Es usted…?» is how sex is usually asked, but so is «¿Es usted cliente?».
+    if (_has_phrase(_fold_words(label), "es usted") or _has_phrase(_fold_words(label), "voce e")) and value_words & _SEX_VALUES:
+        return BannerType.GENDER
+    if not about_someone_else and _age_ranges_in_values(categories):
+        return BannerType.AGE_GROUP
+    return None
+
 
 # =============================================================================
 # Value Label Analysis Patterns (Multi-language support)
@@ -868,6 +979,12 @@ class PatternDetector:
             # Determine banner type
             banner_type = self._get_banner_type(var_name, var_meta)
 
+            # A numeric age (one column with 18, 19, 20…) is never a banner:
+            # only an age in ranges is. Its value labels are usually just the
+            # non-answers (99 = "No responde"), which is why it got here.
+            if banner_type == BannerType.AGE and self._looks_continuous(var_name):
+                continue
+
             # Get categories
             categories = [v.get_text(self.text_key) for v in var_meta.values]
 
@@ -880,6 +997,47 @@ class PatternDetector:
                 categories=categories,
             )
             banners.append(banner)
+
+        # Second pass (2026-11-10): profile questions the classifier does not
+        # see as DEMOGRAPHIC because `PATTERNS` only match a whole word when
+        # it is joined by `-`/`_` ("SEXO", "edad_grupo"), never inside a label
+        # with spaces ("¿En cuál ciudad vive?"), and without accents.
+        # `PATTERNS` and `_classify_variable` are NOT touched: they also decide
+        # every question's type (NPS, scale…), so this pass only adds banners.
+        from quantipymrx.core.metadata import VariableType
+        already = {b.variable for b in banners}
+        # Only kinds the first pass did not find: a second «gender» question (a
+        # gender-identity item) must not push income or education out of the
+        # banners a file already had.
+        covered = {b.banner_type for b in banners}
+        for var_name, detected in self._detected_variables.items():
+            if var_name in already or detected.question_type in (
+                QuestionType.ID, QuestionType.WEIGHT, QuestionType.DEMOGRAPHIC,
+            ):
+                continue
+            var_meta = self.meta.get_variable(var_name)
+            if not var_meta or not var_meta.values or len(var_meta.values) < 2:
+                continue
+            if var_meta.type not in (VariableType.SINGLE, VariableType.INT, VariableType.FLOAT):
+                continue
+            categories = [v.get_text(self.text_key) for v in var_meta.values]
+            banner_type = _profile_banner_type(
+                var_name, var_meta.get_label(self.text_key), categories,
+            )
+            if banner_type is None or banner_type in covered:
+                continue
+            if banner_type == BannerType.AGE and self._looks_continuous(var_name):
+                continue
+            banners.append(DetectedBanner(
+                variable=var_name,
+                label=var_meta.get_label(self.text_key),
+                banner_type=banner_type,
+                confidence=0.75,
+                n_categories=len(var_meta.values),
+                categories=categories,
+            ))
+            already.add(var_name)
+            covered.add(banner_type)
 
         # Sort by confidence and type priority
         type_priority = {
@@ -895,6 +1053,15 @@ class PatternDetector:
         banners.sort(key=lambda b: (type_priority.get(b.banner_type, 10), -b.confidence))
 
         return banners
+
+    def _looks_continuous(self, var_name: str) -> bool:
+        """A column with many distinct values (an age in years, a score)."""
+        if self.data is None or var_name not in self.data.columns:
+            return False
+        try:
+            return int(self.data[var_name].dropna().nunique()) > 15
+        except Exception:  # pragma: no cover - defensive
+            return False
 
     def _get_banner_type(self, var_name: str, var_meta: "VariableMeta") -> BannerType:
         """Determine the banner type for a variable."""
